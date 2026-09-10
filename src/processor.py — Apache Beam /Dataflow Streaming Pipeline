@@ -1,0 +1,131 @@
+"""
+Apache Beam streaming pipeline.
+Reads from Pub/Sub, applies windowing + aggregation, writes to BigQuery.
+
+Run locally:
+    python -m src.processor --runner DirectRunner
+
+Deploy to Dataflow:
+    python -m src.processor \
+        --runner DataflowRunner \
+        --project your-gcp-project-id \
+        --region us-central1 \
+        --temp_location gs://your-bucket/temp \
+        --staging_location gs://your-bucket/staging
+"""
+
+import json
+import argparse
+from datetime import datetime, timezone
+
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.transforms.window import FixedWindows
+from apache_beam.io.gcp.bigquery import WriteToBigQuery, BigQueryDisposition
+
+from src.utils import load_config
+
+
+config = load_config()
+PROJECT = config["gcp"]["project_id"]
+DATASET = config["bigquery"]["dataset"]
+TABLE = config["bigquery"]["table"]
+TABLE_REF = f"{PROJECT}:{DATASET}.{TABLE}"
+SUBSCRIPTION = (
+    f"projects/{PROJECT}/subscriptions/{config['pubsub']['subscription']}"
+)
+
+BQ_SCHEMA = {
+    "fields": [
+        {"name": "post_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "subreddit", "type": "STRING"},
+        {"name": "title", "type": "STRING"},
+        {"name": "author", "type": "STRING"},
+        {"name": "score", "type": "INTEGER"},
+        {"name": "num_comments", "type": "INTEGER"},
+        {"name": "url", "type": "STRING"},
+        {"name": "created_utc", "type": "TIMESTAMP"},
+        {"name": "ingested_at", "type": "TIMESTAMP"},
+        {"name": "polarity", "type": "FLOAT"},
+        {"name": "subjectivity", "type": "FLOAT"},
+        {"name": "sentiment_label", "type": "STRING"},
+        {"name": "processing_time", "type": "TIMESTAMP"},
+        {"name": "window_start", "type": "TIMESTAMP"},
+        {"name": "window_end", "type": "TIMESTAMP"},
+    ]
+}
+
+
+class ParseMessage(beam.DoFn):
+    """Parse Pub/Sub JSON message into a dict."""
+
+    def process(self, element):
+        try:
+            record = json.loads(element.decode("utf-8"))
+            record["processing_time"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            yield record
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"Skipping bad message: {e}")
+
+
+class AddWindowTimestamps(beam.DoFn):
+    """Add window start/end timestamps to each record."""
+
+    def process(self, element, window=beam.DoFn.WindowParam):
+        element["window_start"] = window.start.to_utc_datetime().isoformat()
+        element["window_end"] = window.end.to_utc_datetime().isoformat()
+        yield element
+
+
+class DeduplicateByPostId(beam.DoFn):
+    """Deduplicate posts within a window — keep highest score."""
+
+    def process(self, element):
+        post_id, records = element
+        best = max(records, key=lambda r: r.get("score", 0))
+        yield best
+
+
+def run(argv=None):
+    parser = argparse.ArgumentParser()
+    known_args, pipeline_args = parser.parse_known_args(argv)
+
+    pipeline_options = PipelineOptions(
+        pipeline_args,
+        streaming=True,
+        save_main_session=True,
+    )
+
+    with beam.Pipeline(options=pipeline_options) as p:
+        (
+            p
+            # 1. Read from Pub/Sub
+            | "ReadFromPubSub" >> beam.io.ReadFromPubSub(
+                subscription=SUBSCRIPTION
+            )
+            # 2. Parse JSON messages
+            | "ParseJSON" >> beam.ParDo(ParseMessage())
+            # 3. Apply 60-second fixed windows
+            | "Window" >> beam.WindowInto(FixedWindows(60))
+            # 4. Deduplicate by post_id within window
+            | "KeyByPostId" >> beam.Map(
+                lambda r: (r["post_id"], r)
+            )
+            | "GroupByPostId" >> beam.GroupByKey()
+            | "Deduplicate" >> beam.ParDo(DeduplicateByPostId())
+            # 5. Add window timestamps
+            | "AddWindowTS" >> beam.ParDo(AddWindowTimestamps())
+            # 6. Write to BigQuery
+            | "WriteToBQ" >> WriteToBigQuery(
+                table=TABLE_REF,
+                schema=BQ_SCHEMA,
+                write_disposition=BigQueryDisposition.WRITE_APPEND,
+                create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
+            )
+        )
+
+
+if __name__ == "__main__":
+    run()
