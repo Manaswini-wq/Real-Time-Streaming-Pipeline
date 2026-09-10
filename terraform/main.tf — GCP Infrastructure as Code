@@ -1,0 +1,89 @@
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "region" {
+  default = "us-central1"
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Pub/Sub Topic
+resource "google_pubsub_topic" "reddit_posts" {
+  name = "reddit-posts-topic"
+}
+
+# Pub/Sub Subscription
+resource "google_pubsub_subscription" "reddit_posts_sub" {
+  name  = "reddit-posts-sub"
+  topic = google_pubsub_topic.reddit_posts.id
+
+  ack_deadline_seconds       = 60
+  message_retention_duration = "86400s"
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}
+
+# BigQuery Dataset
+resource "google_bigquery_dataset" "reddit_streaming" {
+  dataset_id = "reddit_streaming"
+  location   = var.region
+}
+
+# BigQuery Table
+resource "google_bigquery_table" "posts_sentiment" {
+  dataset_id = google_bigquery_dataset.reddit_streaming.dataset_id
+  table_id   = "posts_sentiment"
+  deletion_protection = false
+
+  time_partitioning {
+    type  = "DAY"
+    field = "processing_time"
+  }
+
+  schema = <<EOF
+[
+  {"name":"post_id","type":"STRING","mode":"REQUIRED"},
+  {"name":"subreddit","type":"STRING"},
+  {"name":"title","type":"STRING"},
+  {"name":"author","type":"STRING"},
+  {"name":"score","type":"INTEGER"},
+  {"name":"num_comments","type":"INTEGER"},
+  {"name":"url","type":"STRING"},
+  {"name":"created_utc","type":"TIMESTAMP"},
+  {"name":"ingested_at","type":"TIMESTAMP"},
+  {"name":"polarity","type":"FLOAT"},
+  {"name":"subjectivity","type":"FLOAT"},
+  {"name":"sentiment_label","type":"STRING"},
+  {"name":"processing_time","type":"TIMESTAMP"},
+  {"name":"window_start","type":"TIMESTAMP"},
+  {"name":"window_end","type":"TIMESTAMP"}
+]
+EOF
+}
+
+# GCS Bucket for Dataflow temp/staging
+resource "google_storage_bucket" "dataflow_temp" {
+  name     = "${var.project_id}-dataflow-temp"
+  location = var.region
+  force_destroy = true
+}
+
+output "topic_name" {
+  value = google_pubsub_topic.reddit_posts.name
+}
+
+output "subscription_name" {
+  value = google_pubsub_subscription.reddit_posts_sub.name
+}
+
+output "bq_table" {
+  value = "${google_bigquery_dataset.reddit_streaming.dataset_id}.${google_bigquery_table.posts_sentiment.table_id}"
+}
