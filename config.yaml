@@ -1,0 +1,19 @@
+gcp:
+  project_id: "your-gcp-project-id"
+  region: "us-central1"
+
+pubsub:
+  topic: "reddit-posts-topic"
+  subscription: "reddit-posts-sub"
+
+bigquery:
+  dataset: "reddit_streaming"
+  table: "posts_sentiment"
+
+reddit:
+  subreddits:
+    - "technology"
+    - "programming"
+    - "datascience"
+    - "machinelearning"
+  poll_interval_secs: 10
