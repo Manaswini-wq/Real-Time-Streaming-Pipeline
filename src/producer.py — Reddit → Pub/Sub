@@ -1,0 +1,95 @@
+"""Streams Reddit posts into Google Cloud Pub/Sub."""
+
+import json
+import time
+from datetime import datetime, timezone
+
+import praw
+from google.cloud import pubsub_v1
+
+from src.utils import load_config, get_env
+from src.sentiment import analyze
+
+
+def create_reddit_client():
+    return praw.Reddit(
+        client_id=get_env("REDDIT_CLIENT_ID"),
+        client_secret=get_env("REDDIT_CLIENT_SECRET"),
+        user_agent=get_env("REDDIT_USER_AGENT"),
+    )
+
+
+def create_publisher(project_id, topic_name):
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path(project_id, topic_name)
+    return publisher, topic_path
+
+
+def post_to_message(post):
+    sentiment = analyze(post.title)
+    return {
+        "post_id": post.id,
+        "subreddit": str(post.subreddit),
+        "title": post.title,
+        "author": str(post.author) if post.author else "deleted",
+        "score": post.score,
+        "num_comments": post.num_comments,
+        "url": post.url,
+        "created_utc": datetime.fromtimestamp(
+            post.created_utc, tz=timezone.utc
+        ).isoformat(),
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+        "polarity": sentiment["polarity"],
+        "subjectivity": sentiment["subjectivity"],
+        "sentiment_label": sentiment["label"],
+    }
+
+
+def publish_callback(future):
+    try:
+        future.result()
+    except Exception as e:
+        print(f"Publish failed: {e}")
+
+
+def stream_to_pubsub():
+    config = load_config()
+    project_id = get_env("GCP_PROJECT_ID")
+    publisher, topic_path = create_publisher(
+        project_id, config["pubsub"]["topic"]
+    )
+    reddit = create_reddit_client()
+    seen_ids = set()
+
+    print(f"Streaming from r/{config['reddit']['subreddits']} → {topic_path}")
+
+    while True:
+        for subreddit_name in config["reddit"]["subreddits"]:
+            subreddit = reddit.subreddit(subreddit_name)
+            for post in subreddit.new(limit=25):
+                if post.id in seen_ids:
+                    continue
+                seen_ids.add(post.id)
+
+                message = post_to_message(post)
+                data = json.dumps(message).encode("utf-8")
+
+                future = publisher.publish(
+                    topic_path,
+                    data=data,
+                    subreddit=subreddit_name,
+                    sentiment=message["sentiment_label"],
+                )
+                future.add_done_callback(publish_callback)
+                print(f"Published: [{subreddit_name}] {post.title[:60]}... "
+                      f"({message['sentiment_label']})")
+
+        # Cap memory — keep only recent 10k IDs
+        if len(seen_ids) > 10000:
+            seen_ids = set(list(seen_ids)[-5000:])
+
+        time.sleep(config["reddit"]["poll_interval_secs"])
+
+
+if __name__ == "__main__":
+    stream_to_pubsub()
